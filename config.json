@@ -1,0 +1,222 @@
+{
+  "endpoints": [
+    {
+      "_comment": "① OpenRouter — 免费模型，首选端点",
+      "name": "OpenRouter Nemotron",
+      "type": "openrouter",
+      "base": "https://openrouter.ai/api/v1",
+      "key": "sk-or-v1-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "model": "nvidia/nemotron-3-super-120b-a12b:free",
+      "max_tokens": 32768,
+      "context_limit": 80000,
+      "keep_recent": 3,
+      "temperature": 0.7,
+      "top_p": 0.95,
+      "top_k": 40,
+      "frequency_penalty": 0.0,
+      "presence_penalty": 0.0,
+      "repetition_penalty": 1.0,
+      "min_p": 0.0,
+      "top_a": 0.0,
+      "seed": null,
+      "route": null,
+      "stop": null,
+      "parallel_tool_calls": true,
+      "verbosity": "medium",
+      "referer": "ZCode",
+      "title": "ZCode AI Agent",
+      "rpm_limit": 40,
+      "tpm_limit": 0,
+      "qps_limit": 0,
+      "token_budget": 0,
+      "reasoning": {
+        "enabled": false,
+        "mode": "effort",
+        "effort": "medium",
+        "budget": 4000,
+        "exclude": false
+      },
+      "timeout": { "connect": 120, "read": 120 }
+    },
+    {
+      "_comment": "③ Anthropic 原生 API",
+      "name": "Anthropic Direct",
+      "type": "anthropic",
+      "base": "https://api.anthropic.com/v1",
+      "key": "sk-ant-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "model": "claude-sonnet-4-20250514",
+      "max_tokens": 16000,
+      "context_limit": 200000,
+      "keep_recent": 5,
+      "temperature": 0.7,
+      "rpm_limit": 50,
+      "tpm_limit": 400000,
+      "qps_limit": 0,
+      "token_budget": 0,
+      "reasoning": {
+        "enabled": false,
+        "mode": "effort",
+        "effort": "medium",
+        "budget": 8000,
+        "exclude": false
+      },
+      "timeout": { "connect": 60, "read": 300 }
+    },
+    {
+      "_comment": "④ DeepSeek API",
+      "name": "DeepSeek V3",
+      "type": "deepseek",
+      "base": "https://api.deepseek.com/v1",
+      "key": "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "model": "deepseek-chat",
+      "max_tokens": 8192,
+      "context_limit": 64000,
+      "keep_recent": 3,
+      "temperature": 0.7,
+      "top_p": 0.95,
+      "frequency_penalty": 0.0,
+      "presence_penalty": 0.0,
+      "rpm_limit": 60,
+      "tpm_limit": 0,
+      "qps_limit": 0,
+      "token_budget": 0,
+      "reasoning": {
+        "enabled": false,
+        "mode": "effort",
+        "effort": "medium",
+        "budget": 4000
+      },
+      "timeout": { "connect": 30, "read": 120 }
+    },
+    {
+      "_comment": "⑤ DeepSeek-R1（原生推理模型）",
+      "name": "DeepSeek R1",
+      "type": "deepseek",
+      "base": "https://api.deepseek.com/v1",
+      "key": "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "model": "deepseek-reasoner",
+      "max_tokens": 32768,
+      "context_limit": 64000,
+      "keep_recent": 3,
+      "temperature": 0.6,
+      "rpm_limit": 30,
+      "tpm_limit": 0,
+      "qps_limit": 0,
+      "token_budget": 0,
+      "reasoning": {
+        "enabled": true,
+        "mode": "max_tokens",
+        "budget": 32000,
+        "exclude": false
+      },
+      "timeout": { "connect": 30, "read": 300 }
+    },
+    {
+      "_comment": "⑥ llama.cpp server — 本地 Qwen3-35B MoE，GPU+CPU 混合推理",
+      "name": "Local Qwen3-35B",
+      "type": "llama-server",
+      "base": "http://localhost:8080/v1",
+      "key": "",
+      "model": "qwen3-35b-a22b",
+      "max_tokens": 8192,
+      "context_limit": 32768,
+      "keep_recent": 2,
+      "temperature": 0.7,
+      "top_p": 0.95,
+      "top_k": 40,
+      "repetition_penalty": 1.0,
+      "min_p": 0.0,
+      "rpm_limit": 0,
+      "tpm_limit": 0,
+      "qps_limit": 0.3,
+      "token_budget": 0,
+      "reasoning": {
+        "enabled": false,
+        "budget": 2048
+      },
+      "timeout": { "connect": 10, "read": 600 }
+    },
+    {
+      "_comment": "⑦ llama.cpp server — 本地 Qwen3-8B Dense，快速响应",
+      "name": "Local Qwen3-8B",
+      "type": "llama-server",
+      "base": "http://localhost:8081/v1",
+      "key": "",
+      "model": "qwen3-8b",
+      "max_tokens": 4096,
+      "context_limit": 16384,
+      "keep_recent": 2,
+      "temperature": 0.7,
+      "top_k": 40,
+      "repetition_penalty": 1.05,
+      "rpm_limit": 0,
+      "tpm_limit": 0,
+      "qps_limit": 1.0,
+      "token_budget": 0,
+      "reasoning": {
+        "enabled": false,
+        "budget": 1024
+      },
+      "timeout": { "connect": 5, "read": 300 }
+    }
+  ],
+  "compression": {
+    "rounds": [
+      {
+        "name": "首轮压缩",
+        "keep_recent": 5,
+        "summary_max_chars": 500,
+        "trigger_token_ratio": 0.75,
+        "mode": "summarize",
+        "description": "第一轮压缩：保留最近5轮完整对话，较早的对话压缩为摘要"
+      },
+      {
+        "name": "第二轮压缩",
+        "keep_recent": 3,
+        "summary_max_chars": 300,
+        "trigger_token_ratio": 0.85,
+        "mode": "summarize",
+        "description": "第二轮压缩：保留最近3轮完整对话，较早的对话压缩为更短摘要"
+      },
+      {
+        "name": "极限压缩",
+        "keep_recent": 1,
+        "summary_max_chars": 150,
+        "trigger_token_ratio": 0.95,
+        "mode": "truncate",
+        "description": "极限压缩：仅保留最近1轮完整对话，其他以极短摘要形式保留或丢弃"
+      }
+    ]
+  },
+  "system_prompt": "You are ZCode, an expert AI coding assistant. Be concise, precise, and technically rigorous.",
+  "retry": {
+    "max_retries": 3,
+    "delays": [10, 20, 40]
+  },
+  "tool": {
+    "max_loops": 999,
+    "timeout": 120,
+    "command_timeout": 300,
+    "search_timeout": 150,
+    "result_preview_length": 300
+  },
+  "rate_limit": {
+    "_comment": "全局默认值，被 endpoint 级字段覆盖",
+    "enabled": true,
+    "rpm": 0,
+    "tpm": 0,
+    "qps": 0,
+    "token_budget": 0,
+    "retries_on_429": 3,
+    "backoff_delays": [10, 20, 40]
+  },
+  "mcp": {
+    "enabled": false,
+    "servers": {}
+  },
+  "skills": {
+    "enabled": true,
+    "dir": "c:\\zcode_aiagent\\skills",
+    "active": ["playwright"]
+  }
+}
