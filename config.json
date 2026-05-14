@@ -1,11 +1,10 @@
 {
   "endpoints": [
     {
-      "_comment": "① OpenRouter — 免费模型，首选端点",
       "name": "OpenRouter Nemotron",
       "type": "openrouter",
       "base": "https://openrouter.ai/api/v1",
-      "key": "sk-or-v1-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "key": "",
       "model": "nvidia/nemotron-3-super-120b-a12b:free",
       "max_tokens": 32768,
       "context_limit": 80000,
@@ -30,16 +29,18 @@
       "qps_limit": 0,
       "token_budget": 0,
       "reasoning": {
-        "enabled": false,
+        "enabled": true,
         "mode": "effort",
         "effort": "medium",
         "budget": 4000,
         "exclude": false
       },
-      "timeout": { "connect": 120, "read": 120 }
+      "timeout": {
+        "connect": 120,
+        "read": 120
+      }
     },
     {
-      "_comment": "③ Anthropic 原生 API",
       "name": "Anthropic Direct",
       "type": "anthropic",
       "base": "https://api.anthropic.com/v1",
@@ -60,10 +61,12 @@
         "budget": 8000,
         "exclude": false
       },
-      "timeout": { "connect": 60, "read": 300 }
+      "timeout": {
+        "connect": 60,
+        "read": 300
+      }
     },
     {
-      "_comment": "④ DeepSeek API",
       "name": "DeepSeek V3",
       "type": "deepseek",
       "base": "https://api.deepseek.com/v1",
@@ -86,10 +89,12 @@
         "effort": "medium",
         "budget": 4000
       },
-      "timeout": { "connect": 30, "read": 120 }
+      "timeout": {
+        "connect": 30,
+        "read": 120
+      }
     },
     {
-      "_comment": "⑤ DeepSeek-R1（原生推理模型）",
       "name": "DeepSeek R1",
       "type": "deepseek",
       "base": "https://api.deepseek.com/v1",
@@ -109,10 +114,12 @@
         "budget": 32000,
         "exclude": false
       },
-      "timeout": { "connect": 30, "read": 300 }
+      "timeout": {
+        "connect": 30,
+        "read": 300
+      }
     },
     {
-      "_comment": "⑥ llama.cpp server — 本地 Qwen3-35B MoE，GPU+CPU 混合推理",
       "name": "Local Qwen3-35B",
       "type": "llama-server",
       "base": "http://localhost:8080/v1",
@@ -134,10 +141,12 @@
         "enabled": false,
         "budget": 2048
       },
-      "timeout": { "connect": 10, "read": 600 }
+      "timeout": {
+        "connect": 10,
+        "read": 600
+      }
     },
     {
-      "_comment": "⑦ llama.cpp server — 本地 Qwen3-8B Dense，快速响应",
       "name": "Local Qwen3-8B",
       "type": "llama-server",
       "base": "http://localhost:8081/v1",
@@ -157,7 +166,10 @@
         "enabled": false,
         "budget": 1024
       },
-      "timeout": { "connect": 5, "read": 300 }
+      "timeout": {
+        "connect": 5,
+        "read": 300
+      }
     }
   ],
   "compression": {
@@ -191,24 +203,31 @@
   "system_prompt": "You are ZCode, an expert AI coding assistant. Be concise, precise, and technically rigorous.",
   "retry": {
     "max_retries": 3,
-    "delays": [10, 20, 40]
+    "delays": [
+      10,
+      20,
+      40
+    ]
   },
   "tool": {
     "max_loops": 999,
-    "timeout": 120,
+    "timeout": 300,
     "command_timeout": 300,
-    "search_timeout": 150,
+    "search_timeout": 300,
     "result_preview_length": 300
   },
   "rate_limit": {
-    "_comment": "全局默认值，被 endpoint 级字段覆盖",
     "enabled": true,
     "rpm": 0,
     "tpm": 0,
     "qps": 0,
     "token_budget": 0,
     "retries_on_429": 3,
-    "backoff_delays": [10, 20, 40]
+    "backoff_delays": [
+      10,
+      20,
+      40
+    ]
   },
   "mcp": {
     "enabled": false,
@@ -216,7 +235,9 @@
   },
   "skills": {
     "enabled": true,
-    "dir": "c:\\zcode_aiagent\\skills",
-    "active": ["playwright"]
+    "dir": "c:\\zxl\\zxl_toolchain\\zcode_aiagent\\skills",
+    "active": [
+      "playwright"
+    ]
   }
 }

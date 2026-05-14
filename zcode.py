@@ -19,6 +19,7 @@ Update 2026-05-03:
 - 取消 /skill 命令，技能完全自动匹配
 """
 import asyncio
+import copy
 import json
 import os
 import re
@@ -29,38 +30,33 @@ import unicodedata
 import warnings
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 warnings.filterwarnings("ignore", category=ResourceWarning)
 import httpx
 import tiktoken
+_TIKTOKEN_ENC = None
+def _get_tiktoken_enc():
+    global _TIKTOKEN_ENC
+    if _TIKTOKEN_ENC is None:
+        _TIKTOKEN_ENC = tiktoken.get_encoding("cl100k_base")
+    return _TIKTOKEN_ENC
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.css.query import NoMatches
 from textual.reactive import reactive
-from textual.screen import ModalScreen
 from textual.widget import Widget
 from textual.widgets import (
     Button,
     Collapsible,
     Footer,
     Header,
-    Input,
-    Label,
-    ListItem,
-    ListView,
     Markdown,
-    Select,
     Static,
-    Switch,
     TextArea,
 )
 # ─────────────────────────── Config ───────────────────────────
 CONFIG_TEMPLATE_PATH = Path(__file__).parent / "config.json"
-
-# Canonical endpoint type strings
-EP_TYPES = frozenset(["anthropic", "openrouter", "openai", "deepseek", "llama-server", "generic"])
 
 def _infer_ep_type(base: str) -> str:
     """Guess endpoint type from base URL when 'type' field is absent."""
@@ -78,8 +74,9 @@ def _normalize_config(config: dict) -> dict:
       top-level 'endpoints' list, each entry has a 'type' field.
     Transparently migrates old-style 'api' section configs.
     """
-    # Already new format
+    # Already new format — deep copy to avoid mutating input
     if "endpoints" in config and isinstance(config.get("endpoints"), list):
+        config = copy.deepcopy(config)
         eps = config["endpoints"]
         for ep in eps:
             if "type" not in ep:
@@ -96,9 +93,9 @@ def _normalize_config(config: dict) -> dict:
     else:
         merged_eps = []
         for ep in raw_eps:
-            m = base_defaults.copy(); m.update(ep)
+            m = copy.deepcopy(base_defaults); m.update(ep)
             if "timeout" in ep and isinstance(ep["timeout"], dict):
-                m["timeout"] = {**base_defaults.get("timeout", {}), **ep["timeout"]}
+                m["timeout"] = {**copy.deepcopy(base_defaults.get("timeout", {})), **ep["timeout"]}
             merged_eps.append(m)
 
     # Lift old-style top-level reasoning/context into each endpoint
@@ -128,10 +125,15 @@ def load_default_config() -> dict:
         f"Config template not found: {CONFIG_TEMPLATE_PATH}\n"
         "Please ensure config.json exists in the application directory."
     )
-DEFAULT_CONFIG = load_default_config()
+_DEFAULT_CONFIG_CACHE = None
+def get_default_config() -> dict:
+    global _DEFAULT_CONFIG_CACHE
+    if _DEFAULT_CONFIG_CACHE is None:
+        _DEFAULT_CONFIG_CACHE = load_default_config()
+    return _DEFAULT_CONFIG_CACHE
 def get_skills_dir(config: dict = None) -> Path:
     """Get skills directory from config.json skills.dir, fallback to ~/.claudecode/skills."""
-    cfg = config or DEFAULT_CONFIG
+    cfg = config or get_default_config()
     skills_cfg = cfg.get("skills", {})
     dir_path = skills_cfg.get("dir", "")
     if dir_path:
@@ -139,19 +141,13 @@ def get_skills_dir(config: dict = None) -> Path:
     return Path("~/.claudecode/skills").expanduser()
 def get_mcp_config(config: dict = None) -> dict:
     """Get MCP configuration (servers, enabled)."""
-    cfg = config or DEFAULT_CONFIG
-    return cfg.get("mcp", {"enabled": True, "servers": {}})
-def get_skills_config(config: dict = None) -> dict:
-    """Get skills configuration (enabled, active)."""
-    cfg = config or DEFAULT_CONFIG
-    return cfg.get(
-        "skills", {"enabled": True, "dir": "~/.claudecode/skills", "active": []}
-    )
+    cfg = config or get_default_config()
+    return cfg.get("mcp", {"enabled": False, "servers": {}})
 def load_config() -> dict:
     """Load and normalise config (single source of truth)."""
     skills_dir = get_skills_dir()
     skills_dir.mkdir(parents=True, exist_ok=True)
-    return DEFAULT_CONFIG.copy()
+    return copy.deepcopy(get_default_config())
 # ─────────────────────────── Tokenizer ───────────────────────────
 def _fallback_count_tokens(text: str) -> int:
     """
@@ -166,17 +162,17 @@ def _fallback_count_tokens(text: str) -> int:
         total += 2.0 if w in ("W", "F") else 0.75
     return int(total)
 
-def count_tokens(text: str) -> int:
+def count_tokens(text: str, multiplier: float = 1.0) -> int:
     """优先使用 tiktoken，失败时使用 fallback 估算"""
     if not text:
         return 0
     try:
-        enc = tiktoken.get_encoding("cl100k_base")
-        return len(enc.encode(text))
+        base = len(_get_tiktoken_enc().encode(text))
     except Exception:
-        return _fallback_count_tokens(text)
+        base = _fallback_count_tokens(text)
+    return max(1, int(base * multiplier))
 
-def messages_token_count(messages: list) -> int:
+def messages_token_count(messages: list, multiplier: float = 1.0) -> int:
     """
     计算消息列表的总 token 数，正确处理：
       - content 文本块
@@ -190,31 +186,30 @@ def messages_token_count(messages: list) -> int:
         if isinstance(content, list):
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "text":
-                    total += count_tokens(block.get("text", ""))
+                    total += count_tokens(block.get("text", ""), multiplier)
         elif isinstance(content, str):
-            total += count_tokens(content)
+            total += count_tokens(content, multiplier)
         tool_calls = m.get("tool_calls")
         if tool_calls:
             for tc in tool_calls:
                 fn = tc.get("function", {})
-                total += count_tokens(fn.get("name", ""))
-                total += count_tokens(fn.get("arguments", ""))
+                total += count_tokens(fn.get("name", ""), multiplier)
+                total += count_tokens(fn.get("arguments", ""), multiplier)
         if m.get("role") == "assistant" and isinstance(content, list):
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "tool_use":
-                    total += count_tokens(block.get("name", ""))
-                    import json as _json
-                    total += count_tokens(_json.dumps(block.get("input", {})))
+                    total += count_tokens(block.get("name", ""), multiplier)
+                    total += count_tokens(json.dumps(block.get("input", {})), multiplier)
         if m.get("role") == "user" and isinstance(content, list):
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "tool_result":
-                    total += count_tokens(block.get("content", ""))
+                    total += count_tokens(block.get("content", ""), multiplier)
+        if m.get("role") == "tool":
+            total += count_tokens(m.get("name", ""), multiplier)
+            total += count_tokens(m.get("tool_call_id", ""), multiplier)
         total += 4
     return total
 # ─────────────────────────── Async Rate Limiter ───────────────────────────
-class TokenBudgetExceededError(Exception):
-    """Raised when an endpoint's total token budget is exhausted."""
-
 class AsyncRateLimiter:
     """
     Per-endpoint token-bucket rate limiter supporting:
@@ -289,14 +284,14 @@ class AsyncRateLimiter:
                 self._tpm_bucket -= estimated_tokens
             return wait_time
 
-    def consume_tokens(self, tokens: int):
-        """Called after response completes with actual output token count."""
-        if tokens <= 0:
+    def consume_tokens(self, tokens: int, input_tokens: int = 0):
+        """Called after response completes with actual output (and optionally input) token count."""
+        if tokens <= 0 and input_tokens <= 0:
             return
         # Output tokens reduce the TPM bucket (input was already deducted in acquire)
         if self.tpm_limit > 0:
             self._tpm_bucket -= tokens
-        self._total_tokens_used += tokens
+        self._total_tokens_used += tokens + input_tokens
 
     def force_429_cooldown(self, seconds: int = 60):
         self._rpm_bucket = 0.0
@@ -317,13 +312,10 @@ class AsyncRateLimiter:
             "budget_remaining": budget_remaining,
         }
 # ─────────────────────────── Vision ───────────────────────────
-IMAGE_TOKEN_ESTIMATE = 1000
 MIME_MAP = {
     ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
     ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp",
 }
-def guess_image_mime(path: str) -> str:
-    return MIME_MAP.get(Path(path).suffix.lower(), "image/png")
 # ─────────────────────────── Skills (纯语义自动加载) ───────────────────────────
 def load_skills(config: dict = None) -> dict[str, str]:
     """Load all .md files from the skills directory specified in config.json.
@@ -347,7 +339,7 @@ def load_skills(config: dict = None) -> dict[str, str]:
 def build_system_prompt(config: dict, skills: dict[str, str]) -> str:
     """Build system prompt with available skills listed (not auto-injected).
     The LLM uses the `load_skill` tool to load full skill instructions on demand."""
-    parts = [config["system_prompt"]]
+    parts = [config.get("system_prompt", "You are ZCode, an expert AI coding assistant. Be concise, precise, and technically rigorous.")]
     if skills:
         parts.append("\n\n## Available Skills")
         parts.append("The following skills provide specialized instructions. Use the `load_skill` tool to load a skill when the task matches its domain.\n")
@@ -374,6 +366,7 @@ class MCPClient:
         self.servers: dict[str, dict] = {}
         self.tools: list[dict] = []
         self._procs: dict[str, asyncio.subprocess.Process] = {}
+        self._next_id: int = 1
     async def _readline(self, proc: asyncio.subprocess.Process, timeout: float) -> bytes:
         return await asyncio.wait_for(proc.stdout.readline(), timeout=timeout)
     async def connect(self, name: str, cmd: list[str], env: dict | None = None):
@@ -386,6 +379,16 @@ class MCPClient:
                 stderr=asyncio.subprocess.PIPE, env=e,
             )
             self._procs[name] = proc
+            # 启动后台任务消费 stderr，防止 pipe 阻塞
+            async def _drain_stderr():
+                try:
+                    while True:
+                        line = await proc.stderr.readline()
+                        if not line:
+                            break
+                except Exception:
+                    pass
+            asyncio.get_event_loop().create_task(_drain_stderr())
             for _ in range(30):
                 if proc.returncode is not None:
                     raise Exception(f"MCP process exited with {proc.returncode}")
@@ -444,8 +447,9 @@ class MCPClient:
         retry_delays = [1, 2, 3]
         for attempt in range(max_retries):
             try:
+                req_id = self._next_id; self._next_id += 1
                 req = json.dumps({
-                    "jsonrpc": "2.0", "id": 99, "method": "tools/call",
+                    "jsonrpc": "2.0", "id": req_id, "method": "tools/call",
                     "params": {"name": tool_name, "arguments": arguments}
                 }) + "\n"
                 proc.stdin.write(req.encode()); await proc.stdin.drain()
@@ -485,15 +489,11 @@ class MCPClient:
         for name, proc in self._procs.items():
             try:
                 proc.terminate()
-                try:
-                    proc.wait(timeout=2)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
             except Exception:
-                pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
         self._procs.clear()
         self.tools.clear()
         self.servers.clear()
@@ -519,16 +519,6 @@ def _clean_output(text: str) -> str:
     text = re.sub(r'\r\n', '\n', text)
     return text.strip()
 
-def _decode_output(data: bytes) -> str:
-    if not data:
-        return ""
-    try:
-        return data.decode("utf-8")
-    except UnicodeDecodeError:
-        try:
-            return data.decode("gbk")
-        except UnicodeDecodeError:
-            return data.decode("utf-8", errors="replace")
 async def execute_builtin_tool(name: str, arguments: dict, timeout: int = 30, command_timeout: int = 30, search_timeout: int = 15) -> str:
     try:
         if name == "read_file":
@@ -566,8 +556,9 @@ async def execute_builtin_tool(name: str, arguments: dict, timeout: int = 30, co
                 stdout_b, _ = await asyncio.wait_for(proc.communicate(), timeout=cmd_timeout)
                 output = stdout_b.decode("utf-8", errors="replace") if stdout_b else ""
                 output = _clean_output(output)
-                if len(output) > 8000:
-                    output = output[:8000] + "\n\n... [Output truncated for stability]"
+                max_chars = 8000
+                if len(output) > max_chars:
+                    output = output[:max_chars] + "\n\n... [Output truncated for stability]"
                 return f"STDOUT/STDERR:\n{output}\nEXIT_CODE: {proc.returncode}"
             except asyncio.TimeoutError:
                 try:
@@ -603,22 +594,41 @@ async def execute_builtin_tool(name: str, arguments: dict, timeout: int = 30, co
             return f"Skill '{skill_name}' not found. Available skills: {', '.join(sorted(set(available))) if available else '(none)'}"
         elif name == "search_files":
             s_timeout = arguments.get("timeout", search_timeout)
-            cmd_parts = ["grep", "-r", "--include", arguments.get("file_pattern", "*"), "-n", arguments["pattern"], arguments.get("path", ".")]
-            _env = os.environ.copy()
-            _env.update({"TERM": "dumb", "NO_COLOR": "1"})
-            proc = await asyncio.create_subprocess_exec(
-                *cmd_parts,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                stdin=asyncio.subprocess.DEVNULL,
-                env=_env,
-            )
+            pattern = arguments.get("pattern", "")
+            file_pat = arguments.get("file_pattern", "*")
+            search_path = Path(arguments.get("path", ".")).expanduser()
+            if not pattern:
+                return "Error: 'pattern' is required"
+            re_flags = re.IGNORECASE if sys.platform == "win32" else 0
             try:
-                stdout_b, _ = await asyncio.wait_for(proc.communicate(), timeout=s_timeout)
+                regex = re.compile(pattern, re_flags)
+            except re.error as e:
+                return f"Error: invalid regex pattern: {e}"
+            results = []
+            loop = asyncio.get_event_loop()
+            def _search():
+                matches = []
+                for p in search_path.rglob(file_pat):
+                    if not p.is_file():
+                        continue
+                    try:
+                        for i, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                            if regex.search(line):
+                                matches.append(f"{p}:{i}: {line.rstrip()[:500]}")
+                    except Exception:
+                        pass
+                return matches
+            try:
+                matches = await asyncio.wait_for(
+                    loop.run_in_executor(None, _search), timeout=s_timeout)
             except asyncio.TimeoutError:
-                proc.kill(); await proc.communicate()
                 return f"search_files timed out after {s_timeout}s"
-            return _clean_output(_decode_output(stdout_b)) if stdout_b else "(no matches)"
+            if not matches:
+                return "(no matches)"
+            output = "\n".join(matches[:200])
+            if len(matches) > 200:
+                output += f"\n\n... ({len(matches) - 200} more matches truncated)"
+            return _clean_output(output)
     except Exception as e:
         return f"Tool error: {e}"
     return f"Unknown tool: {name}"
@@ -685,6 +695,7 @@ class LLMClient:
         self.retry = config.get("retry", {})
         self.endpoints: list[dict] = config["endpoints"]
         self.active_endpoint_index = 0
+        self.app = None
         self._init_rate_limiters()
 
     def count_tokens(self, text: str) -> int:
@@ -692,8 +703,7 @@ class LLMClient:
         if not text:
             return 0
         try:
-            enc = tiktoken.get_encoding("cl100k_base")
-            return len(enc.encode(text))
+            return len(_get_tiktoken_enc().encode(text))
         except Exception:
             return _fallback_count_tokens(text)
 
@@ -703,10 +713,18 @@ class LLMClient:
     def _init_rate_limiters(self):
         rl_cfg = self.config.get("rate_limit", {})
         rl_enabled = rl_cfg.get("enabled", True)
-        g_rpm    = rl_cfg.get("rpm", 0)    if rl_enabled else 0
-        g_tpm    = rl_cfg.get("tpm", 0)    if rl_enabled else 0
-        g_qps    = rl_cfg.get("qps", 0.0)  if rl_enabled else 0.0
-        g_budget = rl_cfg.get("token_budget", 0) if rl_enabled else 0
+        api_cfg = self.config.get("api", {})
+        if rl_enabled:
+            g_rpm    = rl_cfg.get("rpm", 0)
+            g_tpm    = rl_cfg.get("tpm", 0)
+            g_qps    = rl_cfg.get("qps", 0.0)
+            g_budget = rl_cfg.get("token_budget", 0)
+        else:
+            g_rpm = g_tpm = 0; g_qps = 0.0; g_budget = 0
+        # 兼容旧版 api.rpm_limit / api.tpm_limit
+        if g_rpm <= 0 and g_tpm <= 0:
+            g_rpm = int(api_cfg.get("rpm_limit", 0))
+            g_tpm = int(api_cfg.get("tpm_limit", 0))
         self._limiters: dict[int, AsyncRateLimiter] = {}
         for i, ep in enumerate(self.endpoints):
             rpm    = int(ep.get("rpm_limit",    g_rpm))
@@ -757,11 +775,16 @@ class LLMClient:
     def _model_supports_thinking(self, model: str) -> bool:
         if not model: return False
         m = model.lower()
+        if "claude" not in m:
+            return False
         return any(s in m for s in self.ANTHROPIC_THINKING_MODELS) or "sonnet" in m or "3.7" in m
 
     def _is_reasoning_model(self, model: str) -> bool:
         if not model: return False
-        return model.lower().startswith(("o1-", "o3-", "o4-", "o3-mini", "o4-mini"))
+        ml = model.lower()
+        if ml in ("o1", "o3", "o4"):
+            return True
+        return ml.startswith(("o1-", "o3-", "o4-", "o1-mini", "o3-mini", "o4-mini"))
 
     def build_payload(self, messages: list, tools: list, stream: bool = True) -> dict:
         ep       = self.get_active_endpoint()
@@ -839,6 +862,32 @@ class LLMClient:
                 budget = reasoning.get("budget", reasoning.get("max_tokens", 4000))
                 payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
         return payload
+    @staticmethod
+    def _sanitize_request_for_log(headers: dict, payload: dict) -> tuple[dict, dict]:
+        safe_headers = {}
+        for k, v in headers.items():
+            if k.lower() in ("authorization", "x-api-key"):
+                safe_headers[k] = v[:20] + "***" if len(v) > 20 else "***"
+            else:
+                safe_headers[k] = v
+        safe_payload = {}
+        for k, v in payload.items():
+            if k == "messages":
+                safe_msgs = []
+                for m in v:
+                    mc = m.copy()
+                    if "content" in mc:
+                        c = mc["content"]
+                        if isinstance(c, str) and len(c) > 200:
+                            mc["content"] = c[:200] + f"...[{len(c)} chars]"
+                        elif isinstance(c, list):
+                            mc["content"] = f"[{len(c)} content blocks]"
+                    safe_msgs.append(mc)
+                safe_payload[k] = safe_msgs
+            else:
+                safe_payload[k] = v
+        return safe_headers, safe_payload
+
     def _format_tools(self, tools: list) -> list:
         return [{"type": "function", "function": {"name": t["function"]["name"], "description": t["function"]["description"], "parameters": t["function"]["parameters"]}} for t in tools]
     async def stream_completion(self, messages: list, tools: list):
@@ -859,7 +908,6 @@ class LLMClient:
                     last_error_msg = f"Connection error ({type(e).__name__}): {e}"
                     if attempt < max_retries - 1:
                         delay = retry_cfg.get("delays", [10, 20, 40])[attempt] if attempt < len(retry_cfg.get("delays", [])) else 10
-                        yield ("error", f"{last_error_msg}\nRetrying in {delay}s...")
                         await asyncio.sleep(delay)
                         continue
                 except httpx.HTTPStatusError as e:
@@ -874,7 +922,6 @@ class LLMClient:
                         last_error_msg = f"HTTP 429 Rate Limited\nResponse: {resp_body}"
                         if attempt < max_retries - 1:
                             delay = backoff[attempt] if attempt < len(backoff) else backoff[-1]
-                            yield ("error", f"{last_error_msg}\nBacking off {delay}s...")
                             await asyncio.sleep(delay)
                             continue
                     elif 400 <= status < 500:
@@ -884,7 +931,6 @@ class LLMClient:
                         last_error_msg = f"HTTP {status} Server Error\nResponse: {resp_body}"
                         if attempt < max_retries - 1:
                             delay = retry_cfg.get("delays", [10, 20, 40])[attempt] if attempt < len(retry_cfg.get("delays", [])) else 10
-                            yield ("error", f"{last_error_msg}\nRetrying in {delay}s...")
                             await asyncio.sleep(delay)
                             continue
                 except Exception as e:
@@ -892,13 +938,15 @@ class LLMClient:
                     return
             if last_error_msg:
                 yield ("error", f"{last_error_msg} (max retries exceeded)")
+        self.active_endpoint_index = original_index
         yield ("error", "All API endpoints failed.")
     async def _do_stream(self, messages: list, tools: list):
         budget_err = self.limiter.check_budget()
         if budget_err:
             yield ("error", f"⛔ {budget_err}")
             return
-        input_tokens = messages_token_count(messages)
+        mult = float(self.get_active_endpoint().get("token_count_multiplier", 1.0))
+        input_tokens = messages_token_count(messages, mult)
         wait_time = await self.limiter.acquire(input_tokens)
         if wait_time > 0:
             yield ("rate_limit_wait", wait_time)
@@ -915,35 +963,12 @@ class LLMClient:
         async with httpx.AsyncClient(timeout=timeout, limits=httpx.Limits(max_connections=10)) as client:
             async with client.stream("POST", url, json=payload, headers=headers) as resp:
                 if resp.status_code != 200:
-                    safe_headers = {}
-                    for k, v in headers.items():
-                        if k.lower() in ("authorization", "x-api-key"):
-                            safe_headers[k] = v[:20] + "***" if len(v) > 20 else "***"
-                        else:
-                            safe_headers[k] = v
-                    safe_payload = {}
-                    for k, v in payload.items():
-                        if k == "messages":
-                            safe_msgs = []
-                            for m in v:
-                                mc = m.copy()
-                                if "content" in mc:
-                                    c = mc["content"]
-                                    if isinstance(c, str) and len(c) > 200:
-                                        mc["content"] = c[:200] + f"...[{len(c)} chars]"
-                                    elif isinstance(c, list):
-                                        mc["content"] = f"[{len(c)} content blocks]"
-                                safe_msgs.append(mc)
-                            safe_payload[k] = safe_msgs
-                        else:
-                            safe_payload[k] = v
-                    import json as _json
+                    safe_headers, safe_payload = self._sanitize_request_for_log(headers, payload)
                     try:
                         body = await resp.aread()
                         body_text = body.decode(errors="replace")
                     except Exception:
                         body_text = "(unable to read response body)"
-                    yield ("error", f"HTTP {resp.status_code}\n→ POST {url}\nHeaders: {_json.dumps(safe_headers, ensure_ascii=False)}\nPayload: {_json.dumps(safe_payload, ensure_ascii=False)[:2000]}\n← Response: {body_text[:2000]}")
                     raise httpx.HTTPStatusError(
                         f"HTTP {resp.status_code}: {body_text[:500]}",
                         request=resp.request,
@@ -983,8 +1008,12 @@ class LLMClient:
                                 except json.JSONDecodeError:
                                     args = {}
                                 yield ("tool_call", {"id": tc["id"], "name": tc["name"], "arguments": args})
+                        elif t == "message_delta":
+                            usage = ev.get("usage", {})
+                            if usage:
+                                yield ("done_partial_usage", usage)
                         elif t == "message_stop":
-                            yield ("done", ev.get("usage", {})); return
+                            yield ("done", {}); return
                 else:
                     done_sent = False; oai_accumulated_text = ""; last_usage: dict = {}
                     async for line in resp.aiter_lines():
@@ -1048,36 +1077,6 @@ class LLMClient:
                                             yield ("tool_call", xc)
                                 yield ("done", ev.get("usage", {})); done_sent = True
         return
-    async def non_stream_completion(self, messages: list, tools: list):
-        ep = self.get_active_endpoint()
-        ep_type = self.get_ep_type(ep)
-        is_anthropic = ep_type == "anthropic"
-        base = ep.get("base", "").rstrip("/")
-        url = f"{base}/messages" if is_anthropic else f"{base}/chat/completions"
-        payload = self.build_payload(messages, tools, stream=False)
-        headers = self.get_headers()
-        timeout_cfg = ep.get("timeout", {})
-        timeout = httpx.Timeout(timeout_cfg.get("connect", 120), read=timeout_cfg.get("read", 120))
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(url, json=payload, headers=headers)
-            if resp.status_code != 200:
-                safe_headers = {}
-                for k, v in headers.items():
-                    if k.lower() in ("authorization", "x-api-key"):
-                        safe_headers[k] = v[:20] + "***" if len(v) > 20 else "***"
-                    else:
-                        safe_headers[k] = v
-                import json as _json
-                try:
-                    resp_body = resp.text[:2000]
-                except Exception:
-                    resp_body = "(unable to read response body)"
-                return f"HTTP {resp.status_code}\n→ POST {url}\nHeaders: {_json.dumps(safe_headers, ensure_ascii=False)}\n← Response: {resp_body}"
-            data = resp.json()
-            if is_anthropic:
-                return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
-            choices = data.get("choices", [])
-            return choices[0].get("message", {}).get("content", "") if choices else ""
 # ─────────────────────────── Context Compression (Progressive Rounds) ───────────────────────────
 def _load_compression_rounds(config: dict) -> list[dict]:
     comp = config.get("compression", {})
@@ -1092,18 +1091,19 @@ def _get_active_compression_round(rounds: list[dict], token_count: int, context_
             return r
     return None
 def apply_progressive_compression(messages: list, system_prompt: str, config: dict,
-                                   context_limit: int | None = None) -> list:
+                                   context_limit: int | None = None,
+                                   multiplier: float = 1.0) -> list:
     rounds = _load_compression_rounds(config)
     ctx_limit = context_limit or config.get("context", {}).get("limit") or 80000
     all_msgs = [{"role": "system", "content": system_prompt}] + messages
-    active_round = _get_active_compression_round(rounds, messages_token_count(all_msgs), ctx_limit)
+    active_round = _get_active_compression_round(rounds, messages_token_count(all_msgs, multiplier), ctx_limit)
     if active_round is None:
         return messages
     return _compress_messages(messages, system_prompt, active_round.get("keep_recent", 3), active_round.get("summary_max_chars", 500), active_round.get("mode", "summarize"))
 def _compress_messages(messages: list, system_prompt: str, keep_recent: int, summary_max_chars: int, mode: str) -> list:
     non_system = [m for m in messages if m["role"] != "system"]
     if len(non_system) <= 0:
-        return messages
+        return non_system
     turns = []; current_turn = []
     for m in non_system:
         if m.get("role") == "user":
@@ -1175,7 +1175,6 @@ class MessageBlock(Widget):
             else:
                 yield Markdown(self._content, classes="msg-content")
 class StreamingBlock(Widget):
-    text = reactive("", layout=False, repaint=False)
     def __init__(self, role: str):
         super().__init__(); self._role = role; self._static: Static | None = None; self._content = ""
     def compose(self) -> ComposeResult:
@@ -1183,7 +1182,7 @@ class StreamingBlock(Widget):
         with Collapsible(title=f"[bold {color}]{_escape_rich_markup(label)}[/] [dim]{ts}[/]", collapsed=False, id=f"stream-{id(self)}"):
             self._static = Static("▌", classes="msg-content", markup=False); self._static.styles.height = "auto"; yield self._static
     def append(self, chunk: str):
-        self._content += chunk; self.text += chunk
+        self._content += chunk
         if self._static:
             self._static.update(self._content + "▌")
     def finalize(self) -> str:
@@ -1276,7 +1275,8 @@ class ZCodeApp(App):
                 pass
             with Horizontal(id="toolbar"):
                 yield Button("⚙ Tools: ON", id="btn-tools", classes="toolbar-btn -active")
-                yield Button("◈ Think: OFF", id="btn-thinking", classes="toolbar-btn")
+                _think_enabled = self.llm.get_active_endpoint().get("reasoning", {}).get("enabled", False)
+                yield Button(f"◈ Think: {'ON' if _think_enabled else 'OFF'}", id="btn-thinking", classes="toolbar-btn -active" if _think_enabled else "toolbar-btn")
                 yield Button("✗ Clear", id="btn-clear", classes="toolbar-btn")
                 yield Button("+ New", id="btn-new", classes="toolbar-btn")
                 total = len(self.llm.endpoints)
@@ -1287,13 +1287,9 @@ class ZCodeApp(App):
     def on_mount(self):
         self._start_new_session_file()
         self.update_status()
-        skills_dir = get_skills_dir(self.config)
         self._add_info_message("ZCode ready. Ctrl+Enter to send")
         self._load_mcp()
         self.query_one("#user-input").focus()
-        self._auto_scroll_enabled = True
-        if sys.platform == "win32":
-            self.set_timer(0.4, self._periodic_clean)
         self._sync_thinking_button()
         self._sync_ep_button()
     def _start_new_session_file(self):
@@ -1325,14 +1321,17 @@ class ZCodeApp(App):
     def _log_error(self, msg: str):
         asyncio.get_running_loop().create_task(self._append_to_session(f"### Error\n{msg}\n"))
     def _sync_thinking_button(self):
-        ep = self.llm.get_active_endpoint()
-        enabled = ep.get("reasoning", {}).get("enabled", False)
-        btn = self.query_one("#btn-thinking")
-        btn.label = f"◈ Think: {'ON' if enabled else 'OFF'}"
-        if enabled:
-            btn.add_class("-active")
-        else:
-            btn.remove_class("-active")
+        try:
+            ep = self.llm.get_active_endpoint()
+            enabled = ep.get("reasoning", {}).get("enabled", False)
+            btn = self.query_one("#btn-thinking")
+            btn.label = f"◈ Think: {'ON' if enabled else 'OFF'}"
+            btn.set_class(enabled, "-active")
+            btn.styles.background = "#1F6FEB" if enabled else "#21262D"
+            btn.styles.color = "#FFFFFF" if enabled else "#8B949E"
+            btn.refresh()
+        except Exception:
+            pass
     def _sync_ep_button(self):
         try:
             btn = self.query_one("#btn-ep")
@@ -1349,12 +1348,19 @@ class ZCodeApp(App):
         self.mcp.close_all()
     def _load_mcp(self):
         mcp_cfg = get_mcp_config(self.config)
-        if not mcp_cfg.get("enabled", True):
+        if not mcp_cfg.get("enabled", False):
             return
         for name, srv in mcp_cfg.get("servers", {}).items():
-            cmd = srv.get("command", ""); args = srv.get("args", [])
-            if isinstance(cmd, str):
-                cmd = cmd.split()
+            cmd_raw = srv.get("command", "")
+            args = srv.get("args", [])
+            if not cmd_raw:
+                self._add_info_message(f"MCP server '{name}': no command configured, skipping"); continue
+            if isinstance(cmd_raw, str):
+                cmd = cmd_raw.split()
+            elif isinstance(cmd_raw, list):
+                cmd = list(cmd_raw)
+            else:
+                self._add_info_message(f"MCP server '{name}': invalid command type, skipping"); continue
             if isinstance(args, list):
                 cmd = cmd + args
             asyncio.get_event_loop().create_task(self._connect_mcp(name, cmd, srv.get("env")))
@@ -1371,7 +1377,8 @@ class ZCodeApp(App):
         model = self.llm.get_active_endpoint().get("model", "?").split("/")[-1][:20]
         ep = self.llm.get_active_endpoint()
         ep_type_tag = f"[dim]{ep.get('type','?')}[/]"
-        ctx_used = messages_token_count(self.messages)
+        mult = float(ep.get("token_count_multiplier", 1.0))
+        ctx_used = messages_token_count(self.messages, mult)
         ctx_limit = self.config.get("context", {}).get("limit")
         pct = ctx_used / ctx_limit * 100 if ctx_limit else 0
         ctx_color = "red" if pct > 90 else ("yellow" if pct > 75 else "#8B949E")
@@ -1381,8 +1388,8 @@ class ZCodeApp(App):
         req_pct = total_req / ctx_limit * 100 if ctx_limit else 0
         req_color = "red" if req_pct > 90 else ("yellow" if req_pct > 75 else "#58A6FF")
         flags = []
-        if self.config.get("reasoning", {}).get("enabled"):
-            flags.append("[#CE93D8]think[/]")
+        _think_on = self.llm.get_active_endpoint().get("reasoning", {}).get("enabled", False)
+        flags.append("[#CE93D8]think:ON[/]" if _think_on else "[dim]think:OFF[/]")
         if not self.tools_enabled:
             flags.append("[dim]no-tools[/]")
         flags.append(f"[#58A6FF]mcp:{len(self.mcp.tools)}[/]")
@@ -1425,9 +1432,6 @@ class ZCodeApp(App):
             self.query_one("#chat-area", ScrollableContainer).scroll_end(animate=False)
         except Exception:
             pass
-    def _check_scroll_position(self):
-        pass  # placeholder for scroll position checks
-
     def _guess_mime(self, path: str) -> str:
         return MIME_MAP.get(Path(path).suffix.lower(), "image/png")
 
@@ -1461,11 +1465,20 @@ class ZCodeApp(App):
         if not self._pending_images:
             return {"role": "user", "content": text}
         content = []
+        is_anthropic = self.llm.get_ep_type() == "anthropic"
         for img in self._pending_images:
-            content.append({
-                "type": "image_url",
-                "image_url": {"url": img["data"]}
-            })
+            mime = img.get("mime_type", "image/png")
+            b64 = img["data"].split(";base64,", 1)[-1] if ";base64," in img["data"] else img["data"]
+            if is_anthropic:
+                content.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": mime, "data": b64}
+                })
+            else:
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": img["data"]}
+                })
         content.append({"type": "text", "text": text})
         attached = [img["path"] for img in self._pending_images]
         self._add_info_message(f"📷 Sending with {len(attached)} image(s): {', '.join(Path(p).name for p in attached)}")
@@ -1505,26 +1518,44 @@ class ZCodeApp(App):
         text = inp.text.strip()
         if text and not self._streaming:
             inp.clear(); self._submit_message(text)
+    def _save_config(self):
+        """将当前 self.config（含所有 endpoint 的 reasoning 状态）写回 config.json。"""
+        try:
+            with open(CONFIG_TEMPLATE_PATH, "w", encoding="utf-8") as f:
+                json.dump(self.config, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self.notify(f"⚠ 保存配置失败: {e}", severity="warning")
+
     def action_toggle_thinking(self):
         ep = self.llm.get_active_endpoint()
         ep_reasoning = ep.setdefault("reasoning", {})
         ep_reasoning["enabled"] = not ep_reasoning.get("enabled", False)
-        self._sync_thinking_button(); self.update_status()
+        self._save_config()
+        btn = self.query_one("#btn-thinking")
+        on = ep_reasoning['enabled']
+        btn.label = f"◈ Think: {'ON' if on else 'OFF'}"
+        btn.set_class(on, "-active")
+        btn.styles.background = "#1F6FEB" if on else "#21262D"
+        btn.styles.color = "#FFFFFF" if on else "#8B949E"
+        btn.refresh()
+        self.update_status()
         ep_name = ep.get("name", f"ep{self.llm.active_endpoint_index + 1}")
-        self.notify(f"Thinking [{ep_name}]: {'ON' if ep_reasoning['enabled'] else 'OFF'}")
+        self.notify(f"Thinking [{ep_name}]: {'ON' if on else 'OFF'}")
     def action_toggle_tools(self):
         self.tools_enabled = not self.tools_enabled
         btn = self.query_one("#btn-tools")
-        btn.label = f"⚙ Tools: {'ON' if self.tools_enabled else 'OFF'}"
-        if self.tools_enabled:
-            btn.add_class("-active")
-        else:
-            btn.remove_class("-active")
+        on = self.tools_enabled
+        btn.label = f"⚙ Tools: {'ON' if on else 'OFF'}"
+        btn.set_class(on, "-active")
+        btn.styles.background = "#1F6FEB" if on else "#21262D"
+        btn.styles.color = "#FFFFFF" if on else "#8B949E"
+        btn.refresh()
         self.update_status()
     def action_clear_chat(self):
         self.query_one("#chat-area").remove_children(); self._add_info_message("Chat cleared.")
     def action_new_session(self):
         self.messages.clear(); self._total_tokens_in = 0; self._total_tokens_out = 0
+        self._pending_images.clear()
         self.query_one("#chat-area").remove_children(); self._start_new_session_file()
         self._add_info_message("New session started."); self.update_status()
     def action_interrupt(self):
@@ -1552,10 +1583,7 @@ class ZCodeApp(App):
 Skills are loaded on demand via the `load_skill` tool.
 """
         self.query_one("#chat-area").mount(MessageBlock("info", help_text)); self._log_info(help_text); self._scroll_bottom()
-    def _periodic_clean(self) -> None:
-        """Periodic cleanup for Windows platform."""
-        if sys.platform == "win32":
-            self.set_timer(0.4, self._periodic_clean)
+
     # ── Chat submission ──
     def _submit_message(self, text: str):
         # Parse @image: references and load images
@@ -1563,7 +1591,7 @@ Skills are loaded on demand via the `load_skill` tool.
         
         # Handle @skill command: list available skills
         if text.startswith("@skill"):
-            rest = text[len("@skill"):].strip()
+            self._pending_images.clear()
             self.skills = load_skills(self.config)
             skill_list = "\n".join(f"- **{name}**" for name in sorted(self.skills.keys()))
             if not skill_list:
@@ -1587,6 +1615,7 @@ Skills are loaded on demand via the `load_skill` tool.
         sys_prompt = build_system_prompt(self.config, self.skills)
         
         user_msg = self._build_user_message(text)
+        self._pending_images.clear()
         self.messages.append(user_msg)
         self._maybe_compress(sys_prompt)
         full_msgs = [{"role": "system", "content": sys_prompt}] + self.messages
@@ -1610,16 +1639,17 @@ Skills are loaded on demand via the `load_skill` tool.
         if not rounds:
             return
         ctx_limit = self._get_context_limit()
+        mult = float(self.llm.get_active_endpoint().get("token_count_multiplier", 1.0))
         all_msgs = [{"role": "system", "content": sys_prompt}] + self.messages
-        current = messages_token_count(all_msgs)
+        current = messages_token_count(all_msgs, mult)
         active_round = _get_active_compression_round(rounds, current, ctx_limit)
         if active_round is None:
             return
         round_name = active_round.get("name", "Unknown")
         if round_name != self._last_compression_round:
             self._add_info_message(f"⚡ Compression: {round_name}")
-        self.messages = apply_progressive_compression(self.messages, sys_prompt, self.config, ctx_limit)
-        new_count = messages_token_count([{"role": "system", "content": sys_prompt}] + self.messages)
+        self.messages = apply_progressive_compression(self.messages, sys_prompt, self.config, ctx_limit, mult)
+        new_count = messages_token_count([{"role": "system", "content": sys_prompt}] + self.messages, mult)
         self._total_tokens_in = new_count
         self._total_tokens_out = 0
         self._add_info_message(f"✓ Compressed: {current:,} → {new_count:,} tokens")
@@ -1627,9 +1657,15 @@ Skills are loaded on demand via the `load_skill` tool.
 
     def _compress_and_retry(self, tools: list, sys_prompt: str):
         keep_turns = self._get_keep_recent()
+        mult = float(self.llm.get_active_endpoint().get("token_count_multiplier", 1.0))
+        compressed = _compress_messages(self.messages, sys_prompt, keep_turns, 300, "summarize")
+        # 防止重复压缩死循环：如果压缩后消息未变化则放弃重试
+        if compressed == self.messages:
+            self._add_info_message("⚠ Compression had no effect; context overflow is unrecoverable.")
+            return
         self._add_info_message(f"⚡ Context overflow, compressing to last {keep_turns} turns...")
-        self.messages = _compress_messages(self.messages, sys_prompt, keep_turns, 300, "summarize")
-        new_count = messages_token_count([{"role": "system", "content": sys_prompt}] + self.messages)
+        self.messages = compressed
+        new_count = messages_token_count([{"role": "system", "content": sys_prompt}] + self.messages, mult)
         self._total_tokens_in = new_count
         self._total_tokens_out = 0
         self._add_info_message(f"✓ Compressed to {new_count:,} tokens, retrying...")
@@ -1637,16 +1673,16 @@ Skills are loaded on demand via the `load_skill` tool.
         full_msgs = [{"role": "system", "content": sys_prompt}] + self.messages
         self._run_completion(full_msgs, tools, sys_prompt)
 
-    @work(exclusive=False)
+    @work(exclusive=True)
     async def _run_completion(self, messages: list, tools: list, sys_prompt: str):
         chat_area = self.query_one("#chat-area")
         original_ep_index = self.llm.active_endpoint_index
         try:
             loop_count = 0
             tool_cfg = self.config.get("tool", {})
-            max_loops = tool_cfg.get("max_loops"); tool_timeout = tool_cfg.get("timeout")
-            command_timeout = tool_cfg.get("command_timeout"); search_timeout = tool_cfg.get("search_timeout")
-            result_preview_length = tool_cfg.get("result_preview_length")
+            max_loops = tool_cfg.get("max_loops", 100); tool_timeout = tool_cfg.get("timeout", 300)
+            command_timeout = tool_cfg.get("command_timeout", 30); search_timeout = tool_cfg.get("search_timeout", 15)
+            result_preview_length = tool_cfg.get("result_preview_length", 5000)
             while loop_count < max_loops:
                 loop_count += 1
                 self.update_exec_state(f"[dim]turn {loop_count}[/]  [#58A6FF]⟳ requesting model…[/]")
@@ -1678,14 +1714,22 @@ Skills are loaded on demand via the `load_skill` tool.
                     elif event_type == "text_replace":
                         final_text = event_data; full_text = event_data
                         if stream_block.parent is not None:
-                            stream_block.text = event_data; stream_block.finalize()
+                            stream_block._content = event_data
+                            stream_block.finalize()
+                    elif event_type == "done_partial_usage":
+                        usage = event_data
+                        in_t = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
+                        out_t = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
+                        self._total_tokens_in += in_t; self._total_tokens_out += out_t
+                        if self.llm.limiter:
+                            self.llm.limiter.consume_tokens(out_t, in_t)
                     elif event_type == "done":
                         usage = event_data
                         in_t = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
                         out_t = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
                         self._total_tokens_in += in_t; self._total_tokens_out += out_t
                         if self.llm.limiter:
-                            self.llm.limiter.consume_tokens(out_t)
+                            self.llm.limiter.consume_tokens(out_t, in_t)
                     elif event_type == "error":
                         error_msg = str(event_data)
                         if ("maximum context length" in error_msg.lower() or "requested about" in error_msg.lower()) and loop_count == 1:
@@ -1709,6 +1753,9 @@ Skills are loaded on demand via the `load_skill` tool.
                         self._log_assistant(final_text); self.messages.append({"role": "assistant", "content": final_text})
                     elif stream_block.parent is not None:
                         stream_block.remove()
+                    else:
+                        self._log_info("Empty response from AI")
+                        self.messages.append({"role": "assistant", "content": ""})
                     break
                 is_anthropic = self.llm.get_ep_type() == "anthropic"
                 if final_text:
